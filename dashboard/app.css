@@ -117,6 +117,14 @@ tbody tr:last-child td { border-bottom: 0; }
 .rank-num.top { color: var(--amber); }
 
 .model { margin-top: var(--step-4); padding: var(--step-5); display: grid; gap: var(--step-3); }
+.model h3 { margin-top: var(--step-3); }
+.model .facts.check { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--step-3); border: 1px solid var(--border); border-radius: var(--radius-control); background: var(--surface-2); padding: var(--step-3) var(--step-4); }
+.model .facts.check .fact { display: grid; gap: 2px; }
+.model .facts.check .fact b { font-size: 20px; }
+.model table caption { text-align: left; padding: var(--step-2) 0; caption-side: top; }
+.model table td b { font-weight: 600; }
+.num.farm { font-size: 13px; }
+.plan-total { background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-control); padding: var(--step-2) var(--step-3); margin-bottom: var(--step-3); }
 .formula { font-family: var(--font-num); font-size: 13px; line-height: 1.7; color: var(--muted); overflow-wrap: anywhere; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-control); padding: var(--step-3) var(--step-4); }
 .sectors { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: var(--step-2) var(--step-5); margin-top: var(--step-2); }
 .sector { display: flex; justify-content: space-between; gap: var(--step-3); font-size: 13px; border-bottom: 1px dashed var(--border); padding-bottom: var(--step-1); }
