@@ -3,9 +3,11 @@
 // The board covers every slug in the snapshot's watchlist (the floor, never the ceiling) and
 // adds every other pre-token protocol the house's own rule would keep: no token on record, not a
 // wrapped, staked or bridged product of a token that already trades, not an exchange, not a
-// versioned pool, not a chain itself. A protocol is pre-token when its record carries no market
-// cap, no CoinGecko id and no symbol; the snapshot's live-token protocols are kept apart and
-// shown with the market's own values, never mixed into the ranked board.
+// versioned pool. (The watchlist itself names two chains, Hive Protocol and Noble, so chains
+// are not excluded: the rule is the watchlist's own list of exclusions, without its $50M floor.)
+// A protocol is pre-token when its record carries no market cap, no CoinGecko id and no symbol;
+// the snapshot's live-token protocols are kept apart and shown with the market's own values,
+// never mixed into the ranked board.
 //
 // Implied value follows only from the snapshot's own figures. The key input is a sector
 // multiple: for each category, the median market-cap-to-TVL ratio of the live-token protocols
@@ -28,6 +30,18 @@
 // No protocol name is ever special-cased: the same function scores every row, and the sector
 // multiples are recomputed from the snapshot on every run, so a new snapshot ranks a new
 // field. The dashboard states the formula and the sector table it was scored with.
+//
+// The model is checked, not just stated. The live-token peers of every sector are split in
+// two by slug order (even positions fit, odd positions test — the same split on every run),
+// the sector multiples are fit on the fit half only, and the fit predicts the test half's
+// market caps from their TVLs. The dashboard's Model check panel reports the median absolute
+// percentage error and the hit rate (predictions within 50% of the real market cap), overall
+// and per sector, so a reader can see how rough the pricing is before trusting any one row.
+//
+// A farm plan is derived from the protocol's own record (category, chains, TVL, age), never
+// from a hand-written list of names. Gas is priced per chain — Ethereum costs about three
+// times the other chains — and every step carries its own cost in dollars and its own time in
+// minutes, so each plan totals its gas, its capital, its hold and its setup time.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -101,6 +115,16 @@ export interface FarmStep {
   text: string;
   cost: string;
   time: string;
+  cost_usd: number;
+  time_min: number;
+}
+
+/** A farm plan's totals, computed from its steps: gas (fees only), capital locked, hold, setup. */
+export interface FarmTotals {
+  gas_usd: number;
+  capital_usd: number;
+  hold_days: number;
+  setup_min: number;
 }
 
 /** One row of board.json: the ranked board's row. */
@@ -131,6 +155,7 @@ export interface BoardRow {
     age_days: number | null;
   };
   farm_steps: string[];
+  farm: FarmTotals;
 }
 
 /** The dashboard's compact view of one row, with the farm plan generated in the page. */
@@ -148,6 +173,8 @@ export interface RadarRow {
   maturity_multiplier: number;
   sector_multiple: number;
   watchlist: boolean;
+  farm_steps: string[];
+  farm: FarmTotals;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value. */
@@ -168,6 +195,25 @@ export interface SectorRow {
   multiple: number;
 }
 
+/** One sector's blind-check numbers: how the fit-half multiple predicted the test half. */
+export interface SectorValidation {
+  category: string;
+  fit: number;
+  test: number;
+  median_abs_pct_error: number | null;
+  hit_rate_pct: number | null;
+}
+
+/** The blind check of the whole model: fit on half the live peers, predict the other half. */
+export interface ValidationResult {
+  method: string;
+  fit_n: number;
+  test_n: number;
+  median_abs_pct_error: number;
+  hit_rate_pct: number;
+  sectors: SectorValidation[];
+}
+
 /** Everything the dashboard needs: the board, the live set, the sectors, and the model. */
 export interface RadarData {
   as_of: string;
@@ -184,6 +230,7 @@ export interface RadarData {
   rows: RadarRow[];
   live: LiveRow[];
   sectors: SectorRow[];
+  validation: ValidationResult;
 }
 
 /** Why the snapshot is not one this model can score. */
@@ -218,27 +265,41 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
   return Math.max(0, Math.floor((a - b) / DAY_MS));
 }
 
-/**
- * The sector multiples, priced by the snapshot's own live-token protocols: for each category,
- * the median market-cap-to-TVL ratio of its live peers, shrunk toward the global median by
- * `shrink_prior` phantom peers so a category with few live tokens does not set a wild
- * multiple, then clamped to [sector_floor, sector_cap]. Each peer's ratio is winsorized at
- * `sector_winsor` first, so one small-TVL protocol with an outsized token cannot set its
- * sector's price, and a category with fewer than `sector_min_peers` live peers takes the
- * global median outright. The table is sorted by peer count, strongest evidence first.
- */
-export function sectorMultiples(snapshot: Snapshot, model: ModelConstants = MODEL): { byCategory: Map<string, { multiple: number; peers: number }>; global: number; table: SectorRow[] } {
-  const ratios = new Map<string, number[]>();
-  const all: number[] = [];
+/** One live-token peer: the ratio its market already pays for a dollar of its TVL. */
+interface LivePeer {
+  slug: string;
+  category: string;
+  tvl_usd: number;
+  mcap_usd: number;
+  ratio: number;
+}
+
+/** The live-token peers: market cap and TVL both recorded, ratio winsorized at the cap. */
+function livePeers(snapshot: Snapshot, model: ModelConstants): LivePeer[] {
+  const peers: LivePeer[] = [];
   for (const p of snapshot.protocols) {
     if (p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
     const ratio = Math.min(p.mcap_usd / p.tvl_usd, model.sector_winsor);
     if (!Number.isFinite(ratio) || ratio <= 0) continue;
-    all.push(ratio);
-    const key = p.category ?? 'Other';
-    const list = ratios.get(key);
-    if (list) list.push(ratio);
-    else ratios.set(key, [ratio]);
+    peers.push({ slug: p.slug, category: p.category ?? 'Other', tvl_usd: p.tvl_usd, mcap_usd: p.mcap_usd, ratio });
+  }
+  return peers;
+}
+
+/**
+ * Sector multiples fit from one peer list: for each category, the median ratio, shrunk toward
+ * the list's global median by `shrink_prior` phantom peers, clamped to [sector_floor,
+ * sector_cap]; a category with fewer than `sector_min_peers` peers takes the global median
+ * outright. The same fit scores the board (all peers) and the blind check (the fit half).
+ */
+function fitMultiples(peers: LivePeer[], model: ModelConstants): { byCategory: Map<string, { multiple: number; peers: number }>; global: number } {
+  const ratios = new Map<string, number[]>();
+  const all: number[] = [];
+  for (const p of peers) {
+    all.push(p.ratio);
+    const list = ratios.get(p.category);
+    if (list) list.push(p.ratio);
+    else ratios.set(p.category, [p.ratio]);
   }
   const global = median(all, 0.2);
   const byCategory = new Map<string, { multiple: number; peers: number }>();
@@ -252,11 +313,98 @@ export function sectorMultiples(snapshot: Snapshot, model: ModelConstants = MODE
     const multiple = Math.min(model.sector_cap, Math.max(model.sector_floor, shrunk));
     byCategory.set(category, { multiple: round4(multiple), peers: list.length });
   }
+  return { byCategory, global };
+}
+
+/** The multiple a category gets from a fit, or the fit's global median when it has no peers. */
+function fittedMultiple(fit: { byCategory: Map<string, { multiple: number; peers: number }>; global: number }, category: string, model: ModelConstants): number {
+  const peer = fit.byCategory.get(category);
+  if (peer) return peer.multiple;
+  return Math.min(model.sector_cap, Math.max(model.sector_floor, fit.global));
+}
+
+/**
+ * The sector multiples, priced by the snapshot's own live-token protocols: for each category,
+ * the median market-cap-to-TVL ratio of its live peers, shrunk toward the global median by
+ * `shrink_prior` phantom peers so a category with few live tokens does not set a wild
+ * multiple, then clamped to [sector_floor, sector_cap]. Each peer's ratio is winsorized at
+ * `sector_winsor` first, so one small-TVL protocol with an outsized token cannot set its
+ * sector's price, and a category with fewer than `sector_min_peers` live peers takes the
+ * global median outright. The table is sorted by peer count, strongest evidence first.
+ */
+export function sectorMultiples(snapshot: Snapshot, model: ModelConstants = MODEL): { byCategory: Map<string, { multiple: number; peers: number }>; global: number; table: SectorRow[] } {
+  const { byCategory, global } = fitMultiples(livePeers(snapshot, model), model);
   const table: SectorRow[] = [...byCategory.entries()]
     .map(([category, v]) => ({ category, peers: v.peers, multiple: v.multiple }))
     .sort((a, b) => b.peers - a.peers || b.multiple - a.multiple)
     .slice(0, SECTOR_ROWS);
   return { byCategory, global, table };
+}
+
+/** One sector's blind-check row from its test-half errors. */
+function sectorRowFor(category: string, byCategory: Map<string, number[]>, fitPeers: LivePeer[]): SectorValidation {
+  const list = byCategory.get(category) ?? [];
+  const fitCount = fitPeers.filter((p) => p.category === category).length;
+  if (list.length === 0) return { category, fit: fitCount, test: 0, median_abs_pct_error: null, hit_rate_pct: null };
+  const sorted = [...list].sort((a, b) => a - b);
+  const mid = sorted.length >> 1;
+  const med = sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
+  return {
+    category,
+    fit: fitCount,
+    test: list.length,
+    median_abs_pct_error: Math.round(med * 10) / 10,
+    hit_rate_pct: Math.round((list.filter((e) => e <= 50).length / list.length) * 1000) / 10,
+  };
+}
+
+/**
+ * The blind check: the live peers, sorted by slug so the split is the same on every run, are
+ * dealt alternately into a fit half and a test half. The sector multiples are fit on the fit
+ * half only, then each test peer's market cap is predicted from its TVL alone
+ * (predicted = tvl_usd x fitted multiple) and scored against its real market cap. The headline
+ * numbers are the median absolute percentage error and the hit rate — the share of test peers
+ * predicted within 50% of the real market cap — overall and per sector of the sector table.
+ * A median near 100% means the typical prediction is off by about two times: the model ranks
+ * orders of magnitude, it does not price.
+ */
+export function validateModel(snapshot: Snapshot, model: ModelConstants = MODEL): ValidationResult {
+  const peers = livePeers(snapshot, model).sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+  const fitPeers = peers.filter((_, i) => i % 2 === 0);
+  const testPeers = peers.filter((_, i) => i % 2 === 1);
+  const fit = fitMultiples(fitPeers, model);
+  const { table } = sectorMultiples(snapshot, model);
+  const errors: number[] = [];
+  let hits = 0;
+  const byCategory = new Map<string, number[]>();
+  for (const p of testPeers) {
+    const predicted = p.tvl_usd * fittedMultiple(fit, p.category, model);
+    const error = (Math.abs(predicted - p.mcap_usd) / p.mcap_usd) * 100;
+    errors.push(error);
+    if (error <= 50) hits++;
+    const list = byCategory.get(p.category);
+    if (list) list.push(error);
+    else byCategory.set(p.category, [error]);
+  }
+  const medianError = errors.length === 0 ? 0 : median(errors, 0);
+  // Per-sector checks for the sector table's rows, plus every other category that has a test
+  // peer, so a detail drawer can report its own sector's check even off the table.
+  const sectorSet = new Map<string, SectorValidation>();
+  for (const s of table) {
+    sectorSet.set(s.category, sectorRowFor(s.category, byCategory, fitPeers));
+  }
+  for (const category of byCategory.keys()) {
+    if (!sectorSet.has(category)) sectorSet.set(category, sectorRowFor(category, byCategory, fitPeers));
+  }
+  const sectors: SectorValidation[] = [...sectorSet.values()].sort((a, b) => b.test - a.test || (a.category < b.category ? -1 : 1));
+  return {
+    method: 'Live peers split by slug order (even positions fit, odd positions test); sector multiples fit on the fit half only, test market caps predicted from TVL alone; hit = prediction within 50% of the real market cap.',
+    fit_n: fitPeers.length,
+    test_n: testPeers.length,
+    median_abs_pct_error: Math.round(medianError * 10) / 10,
+    hit_rate_pct: testPeers.length === 0 ? 0 : Math.round((hits / testPeers.length) * 1000) / 10,
+    sectors,
+  };
 }
 
 /** The three multipliers, the sector multiple, and the implied value one protocol gets. */
@@ -299,13 +447,12 @@ export function isPreToken(p: SnapshotProtocol): boolean {
 
 /**
  * Whether a protocol is one the board may rank beyond the watchlist: pre-token, not a
- * wrapped/staked/bridged product of a token that trades, not an exchange, not a versioned pool,
- * and not a chain itself. The watchlist's own members are always in, whatever this says.
+ * wrapped/staked/bridged product of a token that trades, not an exchange, not a versioned pool.
+ * The watchlist's own members are always in, whatever this says.
  */
 export function isRankable(p: SnapshotProtocol): boolean {
   if (!isPreToken(p)) return false;
   if (p.category !== null && EXCLUDED_CATEGORIES.has(p.category)) return false;
-  if (p.category === 'Chain') return false;
   if (VERSIONED.test(p.name)) return false;
   if (WRAPPED_WORD.test(p.name)) return false;
   if (EXCHANGE_PREFIX.test(p.name)) return false;
@@ -340,34 +487,38 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     return { p, ...v };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
-  return scored.map((s, i) => ({
-    rank: i + 1,
-    slug: s.p.slug,
-    name: s.p.name,
-    category: s.p.category,
-    chains: s.p.chains,
-    tvl_usd: s.p.tvl_usd,
-    change_7d: s.p.change_7d,
-    mcap_usd: s.p.mcap_usd,
-    listed_at: s.p.listed_at,
-    gecko_id: s.p.gecko_id,
-    symbol: s.p.symbol,
-    token_status: 'pre-token',
-    watchlist: watchlist.has(s.p.slug),
-    age_days: s.age,
-    implied_value_usd: s.implied,
-    model: {
-      sector: s.sector,
-      sector_multiple: s.sectorMultiple,
-      sector_peers: s.peers,
-      growth_pct: s.growthPct,
-      growth_multiplier: round4(s.growthMult),
-      maturity_multiplier: round4(s.maturityMult),
-      chain_multiplier: round4(s.chainMult),
+  return scored.map((s, i) => {
+    const steps = farmSteps(s.p, s.age, watchlist.has(s.p.slug));
+    return {
+      rank: i + 1,
+      slug: s.p.slug,
+      name: s.p.name,
+      category: s.p.category,
+      chains: s.p.chains,
+      tvl_usd: s.p.tvl_usd,
+      change_7d: s.p.change_7d,
+      mcap_usd: s.p.mcap_usd,
+      listed_at: s.p.listed_at,
+      gecko_id: s.p.gecko_id,
+      symbol: s.p.symbol,
+      token_status: 'pre-token',
+      watchlist: watchlist.has(s.p.slug),
       age_days: s.age,
-    },
-    farm_steps: farmSteps(s.p, s.age).map(stepText),
-  }));
+      implied_value_usd: s.implied,
+      model: {
+        sector: s.sector,
+        sector_multiple: s.sectorMultiple,
+        sector_peers: s.peers,
+        growth_pct: s.growthPct,
+        growth_multiplier: round4(s.growthMult),
+        maturity_multiplier: round4(s.maturityMult),
+        chain_multiplier: round4(s.chainMult),
+        age_days: s.age,
+      },
+      farm_steps: steps.map(stepText),
+      farm: farmTotals(steps, capitalFor(s.p), holdDaysFor(s.age)),
+    };
+  });
 }
 
 const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
@@ -455,47 +606,90 @@ function weeklyActionFor(p: SnapshotProtocol): string {
   return 'a deposit, a swap, a vote or a claim';
 }
 
+/** Gas on a chain, in dollars: Ethereum costs about three times the other chains. */
+function gasFor(chain: string, base: number): number {
+  return chain === 'Ethereum' ? base * 3 : base;
+}
+
+/** How many weeks of qualifying actions the hold needs, at one action a week. */
+function weeksFor(hold: number): number {
+  return Math.max(1, Math.round(hold / 7));
+}
+
 /**
- * A protocol's farm plan: six steps, each an action with a cost and a time. The plan is
- * derived from the protocol's own record (category, chains, TVL, age), never from a
- * hand-written list of names.
+ * A protocol's farm plan: six steps, seven for a watchlist protocol, each an action with a
+ * cost and a time. The plan is derived from the protocol's own record (category, chains, TVL,
+ * age), never from a hand-written list of names. Gas is priced per chain, and every step
+ * carries its cost in dollars and its time in minutes so the plan can be totalled.
  */
-export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
+export function farmSteps(p: SnapshotProtocol, age: number | null, watchlist = false): FarmStep[] {
   const chain = chainOf(p);
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
-  return [
+  const weeks = weeksFor(hold);
+  const setupGas = gasFor(chain, capital >= 150 ? 8 : 4);
+  const steps: FarmStep[] = [
     {
       text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline on paper.`,
-      cost: 'under $3 of gas for the first transaction',
+      cost: `about $${gasFor(chain, 3)} of gas for the first transaction on ${chain}`,
       time: '5 minutes',
+      cost_usd: gasFor(chain, 3),
+      time_min: 5,
     },
     {
       text: actionFor(p, capital, chain),
-      cost: `$${capital} of capital and about $${capital >= 150 ? 8 : 4} of gas`,
+      cost: `$${capital} of capital and about $${setupGas} of gas on ${chain}`,
       time: '15 minutes to set up',
+      cost_usd: setupGas,
+      time_min: 15,
     },
     {
       text: secondActionFor(p, capital, chain),
-      cost: 'about $3 of gas',
+      cost: `about $${gasFor(chain, 3)} of gas on ${chain}`,
       time: '10 minutes',
+      cost_usd: gasFor(chain, 3),
+      time_min: 10,
     },
     {
       text: `Make one qualifying action each week, such as ${weeklyActionFor(p)}.`,
-      cost: 'about $2 of gas a week',
-      time: '10 minutes a week',
+      cost: `about $${gasFor(chain, 2)} of gas a week on ${chain}, ${weeks} weeks`,
+      time: `10 minutes a week for ${weeks} weeks`,
+      cost_usd: gasFor(chain, 2) * weeks,
+      time_min: 10 * weeks,
     },
     {
       text: `Hold the position for at least ${hold} days so the activity is counted in more than one snapshot, then open the protocol's own points or rewards page.`,
       cost: `the $${capital} stays in the position`,
       time: `${hold} days`,
+      cost_usd: 0,
+      time_min: 0,
     },
     {
       text: `Claim only from the link the protocol itself publishes, never from a link in a chat or an ad, and write the wallet, the dates and every transaction in a farm log.`,
       cost: 'no fee to check, and never pay to claim',
       time: '10 minutes',
+      cost_usd: 0,
+      time_min: 10,
     },
   ];
+  if (watchlist) {
+    steps.push({
+      text: `Before the hold ends, open the protocol's points or eligibility page a second time and confirm the position still shows, then set a reminder for the next weekly action so the streak is not broken.`,
+      cost: 'no fee to check',
+      time: '5 minutes',
+      cost_usd: 0,
+      time_min: 5,
+    });
+  }
+  return steps;
+}
+
+/** A plan's totals: the gas its steps spend, the capital it locks, the hold, the setup time. */
+export function farmTotals(steps: FarmStep[], capital: number, hold: number): FarmTotals {
+  const gas = steps.reduce((sum, s) => sum + s.cost_usd, 0);
+  // Setup is the one-off minutes; the weekly step (index 3) is recurring, not setup.
+  const setup = steps.reduce((sum, s, i) => (i === 3 ? sum : sum + s.time_min), 0);
+  return { gas_usd: gas, capital_usd: capital, hold_days: hold, setup_min: setup };
 }
 
 /** The live-token protocols, by market cap, for the dashboard's Live token view. */
@@ -531,6 +725,8 @@ export function radarRow(row: BoardRow): RadarRow {
     maturity_multiplier: row.model.maturity_multiplier,
     sector_multiple: row.model.sector_multiple,
     watchlist: row.watchlist,
+    farm_steps: row.farm_steps,
+    farm: row.farm,
   };
 }
 
@@ -539,6 +735,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const board = buildBoard(snapshot, model);
   const live = liveRows(snapshot);
   const { table } = sectorMultiples(snapshot, model);
+  const validation = validateModel(snapshot, model);
   const early = board.filter((r) => !r.watchlist).length;
   const total = board.reduce((sum, r) => sum + r.implied_value_usd, 0);
   const sortedValues = board.map((r) => r.implied_value_usd).sort((a, b) => a - b);
@@ -559,6 +756,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     rows: board.map(radarRow),
     live,
     sectors: table,
+    validation,
   };
   return { board, radar };
 }
