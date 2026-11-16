@@ -15,9 +15,11 @@ Build the best token launch radar. It reads a sealed snapshot of every protocol 
 - **Maturity** — how long it has run with no token (age since first listing, capped at 3 years), from 0.7× to 1.2×.
 - **Chain spread** — 1 + 0.04 per extra chain, up to 4 extra chains.
 
-The board covers all 40 watchlist protocols plus every other pre-token protocol the house's own rule would keep (196 rows), each with an implied value and a six-step farm plan derived from its category, chains, TVL and age — cost and time on every step. Live-token protocols are kept apart in their own view, with their market caps shown: they are the market's own values, and they price the sector multiples.
+The model is checked, not just stated: the 128 live-token peers are split in two by slug order (even positions fit, odd positions test), the sector multiples are fit on the fit half only, and the fit predicts the test half's market caps from their TVLs. The dashboard's Model check panel reports the result — a median absolute error of 91.4% and a hit rate of 20.3% (predictions within 50% of the real market cap) — overall and per sector, so a reader can see how rough the pricing is before trusting any one row.
 
-The dashboard is a static page (`dashboard/`) that renders with no network from the generated `data.js`: a sortable, filterable board, a watchlist-only view, a live-token view, a detail drawer per protocol with the model's own arithmetic, and the sector table the board was scored with.
+The board covers all 40 watchlist protocols plus every other pre-token protocol the house's own rule would keep (198 rows), each with an implied value and a farm plan derived from its category, chains, TVL and age — cost and time on every step, gas priced per chain (Ethereum about three times the others), and a plan total (gas, capital, hold, setup time) on the row and in the detail drawer. Watchlist protocols get a seventh step, a second check of the points page before the hold ends. Live-token protocols are kept apart in their own view, with their market caps shown: they are the market's own values, and they price the sector multiples.
+
+The dashboard is a static page (`dashboard/`) that renders with no network from the generated `data.js`: a sortable, filterable board (text search, category, chain, implied-value band, watchlist-only tab), a live-token view, a detail drawer per protocol with the model's own arithmetic, its sector's blind-check numbers and its farm plan with totals, and the sector table the board was scored with beside the Model check panel.
 
 ## Run it
 
@@ -25,7 +27,7 @@ The dashboard is a static page (`dashboard/`) that renders with no network from 
 mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../kit/input/snapshot.json
 ```
 
-That writes `out/board.json`, `out/data.js`, `out/dashboard/`, `out/screenshots/` and `out/dossier.json`. Node 22.18 or later is required. The three screenshots in `screenshots/` are renders of the dashboard itself: the board, a protocol's detail view, and a filtered view.
+That writes `out/board.json`, `out/data.js`, `out/dashboard/`, `out/screenshots/` and `out/dossier.json`. Node 22.18 or later is required. The three screenshots in `screenshots/` are renders of the dashboard itself: the board, a protocol's detail view, and a filtered view — 1440×1350 retina captures, 282–335 KB each.
 
 ---
 
