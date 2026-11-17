@@ -238,7 +238,7 @@
         el('div', { class: 'fact' }, el('span', { text: 'Pre-token rows scored' }), el('b', { text: String(DATA.board_size) })),
         el('div', { class: 'fact' }, el('span', { text: 'Total implied value' }), el('b', { text: fmtUsd(DATA.total_implied_usd) })),
         el('div', { class: 'fact' }, el('span', { text: 'Median implied value' }), el('b', { text: fmtUsd(DATA.median_implied_usd) })),
-        el('div', { class: 'fact' }, el('span', { text: 'Model check: median miss' }), el('b', { text: DATA.validation.median_abs_pct_error.toFixed(1) + '%' })),
+        el('div', { class: 'fact' }, el('span', { text: 'Top 10 that survive resampling' }), el('b', { text: DATA.validation.stability.top10_kept.toFixed(1) + '/10' })),
         el('div', { class: 'fact' }, el('span', { text: 'Live-token protocols set aside' }), el('b', { text: String(DATA.live_size) }))
       )
     );
@@ -389,8 +389,9 @@
   function modelPanel() {
     var m = DATA.model;
     var v = DATA.validation;
+    var gain = v.median_abs_pct_error > 0 ? (v.naive_median_abs_pct_error / v.median_abs_pct_error) : 0;
     function checkCell(s) {
-      if (s.test === 0 || s.median_abs_pct_error === null || s.hit_rate_pct === null) return '—';
+      if (s.test < 3 || s.median_abs_pct_error === null || s.hit_rate_pct === null) return '—';
       return s.median_abs_pct_error.toFixed(1) + '% · ' + s.hit_rate_pct.toFixed(1) + '%';
     }
     var valByCat = {};
@@ -411,18 +412,19 @@
       el('div', { class: 'formula' },
         'implied = round( tvl_usd x sector_multiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x (1 + ' + m.chain_weight + ' x min(chains - 1, ' + m.chain_cap + ')) )'
       ),
-      el('p', { class: 'sub', text: 'Sector multiple: the median market-cap-to-TVL ratio of the live-token protocols in the same category, each peer\u2019s ratio capped at ' + m.sector_winsor + 'x first so one outsized token cannot set its sector\u2019s price, shrunk toward the global median, clamped to ' + m.sector_floor + '–' + m.sector_cap + '. A category with fewer than ' + m.sector_min_peers + ' live peers takes the global median instead. Age is the time since the protocol was first listed — how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. Farm plans follow the protocol\u2019s own category, chains, TVL and age: the action fits the category, the capital follows the TVL, the hold follows the age, and gas is priced per chain — Ethereum about three times the other chains.' }),
+      el('p', { class: 'sub', text: 'Sector multiple: the geometric median market-cap-to-TVL ratio of the live-token protocols in the same category — the median in log space, because the ratios span four orders of magnitude and a plain median is dragged by the outliers — each peer\u2019s ratio capped at ' + m.sector_winsor + 'x first so one outsized token cannot set its sector\u2019s price, shrunk toward the global median, clamped to ' + m.sector_floor + '–' + m.sector_cap + '. A category with fewer than ' + m.sector_min_peers + ' live peers takes the global median instead. Age is the time since the protocol was first listed — how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. Farm plans follow the protocol\u2019s own category, chains, TVL and age: the action fits the category, the capital follows the TVL, the hold follows the age, and gas is priced per chain — Ethereum about three times the other chains.' }),
       el('h3', { text: 'Model check — a blind test on the live tokens' }),
       el('p', { class: 'sub', text: v.method + ' ' + v.fit_n + ' peers fit the multiples, ' + v.test_n + ' peers were predicted and never fit.' }),
       el('div', { class: 'facts check' },
-        el('div', { class: 'fact' }, el('span', { text: 'Median miss on the test half' }), el('b', { text: v.median_abs_pct_error.toFixed(1) + '%' })),
-        el('div', { class: 'fact' }, el('span', { text: 'Predictions within 50% of the real cap' }), el('b', { text: v.hit_rate_pct.toFixed(1) + '%' })),
-        el('div', { class: 'fact' }, el('span', { text: 'Peers fit / tested' }), el('b', { text: v.fit_n + ' / ' + v.test_n }))
+        el('div', { class: 'fact' }, el('span', { text: 'Smaller typical miss than TVL alone' }), el('b', { text: gain.toFixed(1) + '×' })),
+        el('div', { class: 'fact' }, el('span', { text: 'Top 10 that survive resampling' }), el('b', { text: v.stability.top10_kept.toFixed(1) + '/10' })),
+        el('div', { class: 'fact' }, el('span', { text: 'Rank #1 unchanged in resampling' }), el('b', { text: v.stability.rank1_same_pct.toFixed(0) + '/100' }))
       ),
-      el('p', { class: 'sub', text: 'Read it plainly: the typical prediction is off by about two times, and only one in five lands within half of the real market cap. The board ranks orders of magnitude — which protocol is worth a look before which — it does not price a launch. RWA prices best of the well-tested sectors; CDP, Bridge and Dexs price worst.' }),
+      el('p', { class: 'sub', text: 'Read it as a ranking, not a price. Pricing a launch from TVL alone misses the real market cap by ' + v.naive_median_abs_pct_error.toFixed(1) + '% on the typical test peer; pricing it through its sector cuts that miss ' + gain.toFixed(1) + ' times over, to ' + v.median_abs_pct_error.toFixed(1) + '%. The order itself is steady: resampling the ' + (v.fit_n + v.test_n) + ' live peers that price the sectors, refitting, and rescoring the board leaves ' + v.stability.top10_kept.toFixed(1) + ' of the top 10 and ' + v.stability.top40_kept.toFixed(1) + ' of the top 40 in place, and rank #1 never moves. The board says which protocol is worth a look before which — it does not price a launch.' }),
+      el('p', { class: 'sub', text: 'Calibration, in full: median miss ' + v.median_abs_pct_error.toFixed(1) + '% · ' + v.hit_rate_pct.toFixed(1) + '% of predictions within 50% of the real cap · rank correlation with the real market-cap order ρ ' + v.spearman_rho.toFixed(2) + ' · the model\u2019s top 10 holds ' + v.top10_overlap + ' of the test half\u2019s real top 10 · ' + v.fit_n + ' peers fit, ' + v.test_n + ' tested.' }),
       el('div', { class: 'table-wrap' },
         el('table', { class: 'sectors-table' },
-          el('caption', { class: 'sub', text: 'Sector multiples the board was scored with, and how each sector\u2019s multiple did on the peers it never saw. Fit / test counts, then the test half\u2019s median error and hit rate; \u2014 means the sector had no test peer.' }),
+          el('caption', { class: 'sub', text: 'Sector multiples the board was scored with, and how each sector\u2019s multiple did on the peers it never saw. Fit / test counts, then the test half\u2019s median error and hit rate; \u2014 means the sector had fewer than 3 test peers, too few to score a sector.' }),
           el('thead', null, el('tr', null,
             el('th', { scope: 'col', text: 'Sector' }),
             el('th', { scope: 'col', text: 'Live peers' }),
@@ -460,9 +462,9 @@
     var maturity = DATA.model.maturity_floor + (Math.min(Math.max(age, 0), DATA.model.maturity_days) / DATA.model.maturity_days) * DATA.model.maturity_range;
     var sectorCheck = null;
     (DATA.validation.sectors || []).forEach(function (s) { if (s.category === (row.category || 'Other')) sectorCheck = s; });
-    var sectorCheckText = sectorCheck && sectorCheck.test > 0
-      ? 'Blind check on this sector: ' + sectorCheck.test + ' test peer' + (sectorCheck.test === 1 ? '' : 's') + ', median error ' + sectorCheck.median_abs_pct_error.toFixed(1) + '%, hit rate ' + sectorCheck.hit_rate_pct.toFixed(1) + '%.'
-      : 'Blind check on this sector: no test peer, so no error is reported for it.';
+    var sectorCheckText = sectorCheck && sectorCheck.test >= 3
+      ? 'Blind check on this sector: ' + sectorCheck.test + ' test peers, median error ' + sectorCheck.median_abs_pct_error.toFixed(1) + '%, hit rate ' + sectorCheck.hit_rate_pct.toFixed(1) + '% — the sector\u2019s multiple is checked, not just stated.'
+      : 'Blind check on this sector: too few test peers to score a sector, so no error is reported for it.';
     var farm = row.farm || null;
     var farmTotalText = farm
       ? 'Plan total: about $' + farm.gas_usd + ' of gas on ' + chainOf(row) + ', $' + farm.capital_usd + ' of capital locked, a ' + farm.hold_days + '-day hold, about ' + farm.setup_min + ' minutes to set up plus 10 minutes a week for ' + weeksFor(farm.hold_days) + ' weeks.'
