@@ -10,13 +10,15 @@
 // never mixed into the ranked board.
 //
 // Implied value follows only from the snapshot's own figures. The key input is a sector
-// multiple: for each category, the median market-cap-to-TVL ratio of the live-token protocols
-// in that same category, shrunk toward the global median when the category has few live peers
+// multiple: for each category, the geometric median market-cap-to-TVL ratio of the
+// live-token protocols in that same category — the median in log space, because the ratios
+// span four orders of magnitude (0.000x to 400x) and a plain median is dragged by the
+// outliers — shrunk toward the global median when the category has few live peers
 // and clamped to a sane band. A pre-token protocol is then worth what its sector pays for a
 // dollar of TVL, adjusted for its own momentum, its age with no token, and how many chains it
 // runs on:
 //
-//   sector    = clamp(shrunk median mcap/tvl of live peers in the category, 0.05, 1.00)
+//   sector    = clamp(exp(shrunk median log(mcap/tvl) of live peers in the category), 0.05, 1.00)
 //               each peer's ratio is winsorized at 2.00 first, so one small-TVL protocol
 //               with an outsized token cannot set its sector's price; a category with fewer
 //               than two live peers takes the global median instead of its one peer
@@ -31,12 +33,20 @@
 // multiples are recomputed from the snapshot on every run, so a new snapshot ranks a new
 // field. The dashboard states the formula and the sector table it was scored with.
 //
-// The model is checked, not just stated. The live-token peers of every sector are split in
-// two by slug order (even positions fit, odd positions test — the same split on every run),
-// the sector multiples are fit on the fit half only, and the fit predicts the test half's
-// market caps from their TVLs. The dashboard's Model check panel reports the median absolute
-// percentage error and the hit rate (predictions within 50% of the real market cap), overall
-// and per sector, so a reader can see how rough the pricing is before trusting any one row.
+// The model is checked, not just stated, and the check answers three questions a reader
+// can use. First, pricing: the live-token peers of every sector are split in two by slug
+// order (even positions fit, odd positions test — the same split on every run), the sector
+// multiples are fit on the fit half only, and the fit predicts the test half's market caps
+// from their TVLs — beside the same prediction made with no sector pricing at all (TVL
+// alone), so the check shows what the sector multiple is worth. Second, ranking: the full
+// implied value orders the test half, and its Spearman correlation with the real market-cap
+// order says whether the board's order tracks the market's. Third, stability: the live
+// peers are resampled with replacement (100 resamples, a fixed seed, so the same on every
+// run), the multiples refit, and the board rescored — the check reports how much of the top
+// 10 and top 40 survives, and how often rank 1 stays rank 1. The median error and hit rate
+// stay in the dashboard as calibration diagnostics, in full, beside those three answers:
+// the board ranks orders of magnitude, it does not price a launch, and the check says so
+// plainly instead of dressing the error up as a verdict on the board.
 //
 // A farm plan is derived from the protocol's own record (category, chains, TVL, age), never
 // from a hand-written list of names. Gas is priced per chain — Ethereum costs about three
@@ -102,7 +112,7 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -204,6 +214,14 @@ export interface SectorValidation {
   hit_rate_pct: number | null;
 }
 
+/** How steady the board's order is when the peers that price it are resampled. */
+export interface StabilityResult {
+  resamples: number;
+  top10_kept: number;
+  top40_kept: number;
+  rank1_same_pct: number;
+}
+
 /** The blind check of the whole model: fit on half the live peers, predict the other half. */
 export interface ValidationResult {
   method: string;
@@ -211,6 +229,10 @@ export interface ValidationResult {
   test_n: number;
   median_abs_pct_error: number;
   hit_rate_pct: number;
+  naive_median_abs_pct_error: number;
+  spearman_rho: number;
+  top10_overlap: number;
+  stability: StabilityResult;
   sectors: SectorValidation[];
 }
 
@@ -267,6 +289,7 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
 
 /** One live-token peer: the ratio its market already pays for a dollar of its TVL. */
 interface LivePeer {
+  protocol: SnapshotProtocol;
   slug: string;
   category: string;
   tvl_usd: number;
@@ -281,36 +304,42 @@ function livePeers(snapshot: Snapshot, model: ModelConstants): LivePeer[] {
     if (p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
     const ratio = Math.min(p.mcap_usd / p.tvl_usd, model.sector_winsor);
     if (!Number.isFinite(ratio) || ratio <= 0) continue;
-    peers.push({ slug: p.slug, category: p.category ?? 'Other', tvl_usd: p.tvl_usd, mcap_usd: p.mcap_usd, ratio });
+    peers.push({ protocol: p, slug: p.slug, category: p.category ?? 'Other', tvl_usd: p.tvl_usd, mcap_usd: p.mcap_usd, ratio });
   }
   return peers;
 }
 
 /**
- * Sector multiples fit from one peer list: for each category, the median ratio, shrunk toward
- * the list's global median by `shrink_prior` phantom peers, clamped to [sector_floor,
- * sector_cap]; a category with fewer than `sector_min_peers` peers takes the global median
- * outright. The same fit scores the board (all peers) and the blind check (the fit half).
+ * Sector multiples fit from one peer list: for each category, the geometric median ratio —
+ * the median of the log ratios, because the ratios span four orders of magnitude and a plain
+ * median is dragged by the outliers — shrunk toward the list's global log-median by
+ * `shrink_prior` phantom peers, clamped to [sector_floor, sector_cap]; a category with
+ * fewer than `sector_min_peers` peers takes the global median outright. The same fit scores
+ * the board (all peers) and the blind check (the fit half).
  */
 function fitMultiples(peers: LivePeer[], model: ModelConstants): { byCategory: Map<string, { multiple: number; peers: number }>; global: number } {
   const ratios = new Map<string, number[]>();
   const all: number[] = [];
   for (const p of peers) {
-    all.push(p.ratio);
+    const logRatio = Math.log(p.ratio);
+    all.push(logRatio);
     const list = ratios.get(p.category);
-    if (list) list.push(p.ratio);
-    else ratios.set(p.category, [p.ratio]);
+    if (list) list.push(logRatio);
+    else ratios.set(p.category, [logRatio]);
   }
-  const global = median(all, 0.2);
+  const globalLog = median(all, Math.log(0.2));
+  const logFloor = Math.log(model.sector_floor);
+  const logCap = Math.log(model.sector_cap);
+  const global = round4(Math.exp(Math.min(logCap, Math.max(logFloor, globalLog))));
   const byCategory = new Map<string, { multiple: number; peers: number }>();
   for (const [category, list] of ratios) {
     if (list.length < model.sector_min_peers) {
-      byCategory.set(category, { multiple: round4(Math.min(model.sector_cap, Math.max(model.sector_floor, global))), peers: list.length });
+      byCategory.set(category, { multiple: global, peers: list.length });
       continue;
     }
-    const raw = median(list, global);
-    const shrunk = (list.length * raw + model.shrink_prior * global) / (list.length + model.shrink_prior);
-    const multiple = Math.min(model.sector_cap, Math.max(model.sector_floor, shrunk));
+    const raw = median(list, globalLog);
+    const shrunk = (list.length * raw + model.shrink_prior * globalLog) / (list.length + model.shrink_prior);
+    const multiple = Math.exp(Math.min(logCap, Math.max(logFloor, shrunk)));
     byCategory.set(category, { multiple: round4(multiple), peers: list.length });
   }
   return { byCategory, global };
@@ -325,10 +354,10 @@ function fittedMultiple(fit: { byCategory: Map<string, { multiple: number; peers
 
 /**
  * The sector multiples, priced by the snapshot's own live-token protocols: for each category,
- * the median market-cap-to-TVL ratio of its live peers, shrunk toward the global median by
- * `shrink_prior` phantom peers so a category with few live tokens does not set a wild
- * multiple, then clamped to [sector_floor, sector_cap]. Each peer's ratio is winsorized at
- * `sector_winsor` first, so one small-TVL protocol with an outsized token cannot set its
+ * the geometric median market-cap-to-TVL ratio of its live peers, shrunk toward the global
+ * median by `shrink_prior` phantom peers so a category with few live tokens does not set a
+ * wild multiple, then clamped to [sector_floor, sector_cap]. Each peer's ratio is winsorized
+ * at `sector_winsor` first, so one small-TVL protocol with an outsized token cannot set its
  * sector's price, and a category with fewer than `sector_min_peers` live peers takes the
  * global median outright. The table is sorted by peer count, strongest evidence first.
  */
@@ -358,35 +387,136 @@ function sectorRowFor(category: string, byCategory: Map<string, number[]>, fitPe
   };
 }
 
+/** Spearman's rank correlation of two lists, average ranks for ties, else 0. */
+function spearman(xs: number[], ys: number[]): number {
+  const rank = (values: number[]): number[] => {
+    const order = values.map((v, i) => [v, i] as [number, number]).sort((a, b) => a[0] - b[0]);
+    const out = new Array<number>(values.length);
+    for (let i = 0; i < order.length;) {
+      let j = i;
+      while (j + 1 < order.length && order[j + 1]![0] === order[i]![0]) j++;
+      const avg = (i + j) / 2 + 1;
+      for (let k = i; k <= j; k++) out[order[k]![1]] = avg;
+      i = j + 1;
+    }
+    return out;
+  };
+  const rx = rank(xs);
+  const ry = rank(ys);
+  const n = xs.length;
+  if (n < 2) return 0;
+  const mx = rx.reduce((a, b) => a + b, 0) / n;
+  const my = ry.reduce((a, b) => a + b, 0) / n;
+  let num = 0;
+  let dx = 0;
+  let dy = 0;
+  for (let i = 0; i < n; i++) {
+    num += (rx[i]! - mx) * (ry[i]! - my);
+    dx += (rx[i]! - mx) ** 2;
+    dy += (ry[i]! - my) ** 2;
+  }
+  if (dx === 0 || dy === 0) return 0;
+  return num / Math.sqrt(dx * dy);
+}
+
+/** A fixed-seed generator, so the stability check resamples the same way on every run. */
+function seededRandom(seed: number): () => number {
+  let s = seed | 0;
+  return () => {
+    s = (s + 0x6d2b79f5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/**
+ * How steady the board's order is: the live peers are resampled with replacement, the
+ * sector multiples refit from each resample, and the same board rows rescored, so each
+ * resample re-ranks the board from a different pricing of the sectors. The counts are the
+ * mean over the resamples, to one decimal.
+ */
+function rankStability(board: BoardRow[], snapshot: Snapshot, model: ModelConstants): StabilityResult {
+  const resamples = 100;
+  const baseTop10 = new Set(board.slice(0, 10).map((r) => r.slug));
+  const baseTop40 = new Set(board.slice(0, 40).map((r) => r.slug));
+  const baseRank1 = board[0]!.slug;
+  const peers = livePeers(snapshot, model);
+  const rand = seededRandom(20261117);
+  let kept10 = 0;
+  let kept40 = 0;
+  let rank1Same = 0;
+  for (let i = 0; i < resamples; i++) {
+    const sample: LivePeer[] = [];
+    for (let j = 0; j < peers.length; j++) sample.push(peers[Math.floor(rand() * peers.length)]!);
+    const fit = fitMultiples(sample, model);
+    const rescored = board
+      .map((r) => ({ slug: r.slug, v: impliedValue(r, snapshot.as_of, fit.byCategory, fit.global, model).implied }))
+      .sort((a, b) => b.v - a.v || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+    const top10 = new Set(rescored.slice(0, 10).map((r) => r.slug));
+    const top40 = new Set(rescored.slice(0, 40).map((r) => r.slug));
+    for (const slug of baseTop10) if (top10.has(slug)) kept10++;
+    for (const slug of baseTop40) if (top40.has(slug)) kept40++;
+    if (rescored[0]!.slug === baseRank1) rank1Same++;
+  }
+  return {
+    resamples,
+    top10_kept: Math.round((kept10 / resamples) * 10) / 10,
+    top40_kept: Math.round((kept40 / resamples) * 10) / 10,
+    rank1_same_pct: Math.round((rank1Same / resamples) * 1000) / 10,
+  };
+}
+
 /**
  * The blind check: the live peers, sorted by slug so the split is the same on every run, are
  * dealt alternately into a fit half and a test half. The sector multiples are fit on the fit
  * half only, then each test peer's market cap is predicted from its TVL alone
- * (predicted = tvl_usd x fitted multiple) and scored against its real market cap. The headline
+ * (predicted = tvl_usd x fitted multiple) and scored against its real market cap — beside
+ * the same prediction made with no sector pricing at all (predicted = tvl_usd), so the check
+ * shows what the sector multiple is worth. The ranking check scores the full implied value
+ * against the real market caps on the same test half: Spearman's rho between the two orders,
+ * and how many of the test half's real top 10 the model's top 10 holds. The headline
  * numbers are the median absolute percentage error and the hit rate — the share of test peers
  * predicted within 50% of the real market cap — overall and per sector of the sector table.
  * A median near 100% means the typical prediction is off by about two times: the model ranks
  * orders of magnitude, it does not price.
  */
-export function validateModel(snapshot: Snapshot, model: ModelConstants = MODEL): ValidationResult {
+export function validateModel(snapshot: Snapshot, model: ModelConstants = MODEL, board: BoardRow[] = []): ValidationResult {
   const peers = livePeers(snapshot, model).sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
   const fitPeers = peers.filter((_, i) => i % 2 === 0);
   const testPeers = peers.filter((_, i) => i % 2 === 1);
   const fit = fitMultiples(fitPeers, model);
   const { table } = sectorMultiples(snapshot, model);
   const errors: number[] = [];
+  const naiveErrors: number[] = [];
   let hits = 0;
   const byCategory = new Map<string, number[]>();
+  const impliedTest: number[] = [];
+  const actualTest: number[] = [];
   for (const p of testPeers) {
     const predicted = p.tvl_usd * fittedMultiple(fit, p.category, model);
     const error = (Math.abs(predicted - p.mcap_usd) / p.mcap_usd) * 100;
     errors.push(error);
+    naiveErrors.push((Math.abs(p.tvl_usd - p.mcap_usd) / p.mcap_usd) * 100);
     if (error <= 50) hits++;
     const list = byCategory.get(p.category);
     if (list) list.push(error);
     else byCategory.set(p.category, [error]);
+    impliedTest.push(impliedValue(p.protocol, snapshot.as_of, fit.byCategory, fit.global, model).implied);
+    actualTest.push(p.mcap_usd);
   }
   const medianError = errors.length === 0 ? 0 : median(errors, 0);
+  const naiveMedianError = naiveErrors.length === 0 ? 0 : median(naiveErrors, 0);
+  const rho = spearman(impliedTest, actualTest);
+  const topActual = new Set([...testPeers].sort((a, b) => b.mcap_usd - a.mcap_usd).slice(0, 10).map((p) => p.slug));
+  const topPred = new Set(
+    [...testPeers]
+      .map((p, i) => ({ slug: p.slug, v: impliedTest[i]! }))
+      .sort((a, b) => b.v - a.v || (a.slug < b.slug ? -1 : 1))
+      .slice(0, 10)
+      .map((r) => r.slug),
+  );
+  const top10Overlap = [...topActual].filter((s) => topPred.has(s)).length;
   // Per-sector checks for the sector table's rows, plus every other category that has a test
   // peer, so a detail drawer can report its own sector's check even off the table.
   const sectorSet = new Map<string, SectorValidation>();
@@ -398,11 +528,15 @@ export function validateModel(snapshot: Snapshot, model: ModelConstants = MODEL)
   }
   const sectors: SectorValidation[] = [...sectorSet.values()].sort((a, b) => b.test - a.test || (a.category < b.category ? -1 : 1));
   return {
-    method: 'Live peers split by slug order (even positions fit, odd positions test); sector multiples fit on the fit half only, test market caps predicted from TVL alone; hit = prediction within 50% of the real market cap.',
+    method: 'Live peers split by slug order (even positions fit, odd positions test); sector multiples fit on the fit half only, test market caps predicted from TVL and the fitted multiple, beside the same prediction with no sector pricing (TVL alone); hit = prediction within 50% of the real market cap. Ranking: the full implied value orders the test half against the real market-cap order. Stability: 100 resamples of the live peers with replacement, multiples refit, board rescored.',
     fit_n: fitPeers.length,
     test_n: testPeers.length,
     median_abs_pct_error: Math.round(medianError * 10) / 10,
     hit_rate_pct: testPeers.length === 0 ? 0 : Math.round((hits / testPeers.length) * 1000) / 10,
+    naive_median_abs_pct_error: Math.round(naiveMedianError * 10) / 10,
+    spearman_rho: Math.round(rho * 1000) / 1000,
+    top10_overlap: top10Overlap,
+    stability: board.length > 0 ? rankStability(board, snapshot, model) : { resamples: 0, top10_kept: 0, top40_kept: 0, rank1_same_pct: 0 },
     sectors,
   };
 }
@@ -735,7 +869,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const board = buildBoard(snapshot, model);
   const live = liveRows(snapshot);
   const { table } = sectorMultiples(snapshot, model);
-  const validation = validateModel(snapshot, model);
+  const validation = validateModel(snapshot, model, board);
   const early = board.filter((r) => !r.watchlist).length;
   const total = board.reduce((sum, r) => sum + r.implied_value_usd, 0);
   const sortedValues = board.map((r) => r.implied_value_usd).sort((a, b) => a - b);
